@@ -1,0 +1,1016 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage{listings}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    columns=fullflexible,
+    frame=single,
+    keepspaces=true,
+    showstringspaces=false
+}
+
+\title{Mathematical Engine Notes for the PRNG Casino Modules}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Scope}
+
+This document explains the math behind the modules in this repository:
+
+\begin{itemize}
+    \item \texttt{prng.py}: shared deterministic HMAC-SHA256 pseudo-random generator.
+    \item \texttt{game\_config.json} and \texttt{game\_config.py}: editable game math settings.
+    \item \texttt{cards.py}: deck construction and unbiased Fisher-Yates shuffling.
+    \item \texttt{prng\_crash\_limbo.py}: crash-game multiplier generation.
+    \item \texttt{slots.py}: weighted reels, paylines, scatters, and RTP calculation.
+    \item \texttt{baccarat.py}: digital baccarat dealing, totals, draw rules, and settlement.
+    \item \texttt{blackjack.py}: digital blackjack dealing, hand valuation, actions, dealer rules, and settlement.
+\end{itemize}
+
+The common design is:
+
+\[
+(\text{server seed}, \text{client seed}, \text{nonce}) \longrightarrow
+\text{HMAC-SHA256 output} \longrightarrow \text{game-specific outcome}.
+\]
+
+The server seed is private before the game. Its hash may be published first as a commitment:
+
+\[
+C_S = \operatorname{SHA256}(S),
+\]
+
+where \(S\) is the server seed and \(C_S\) is the public commitment. After the game, revealing \(S\) lets a player verify that the seed matches the prior commitment.
+
+\section{Shared PRNG: \texttt{prng.py}}
+
+\subsection{HMAC Byte Stream}
+
+The generator creates a deterministic byte stream from:
+
+\[
+S = \text{server seed}, \qquad
+C = \text{client seed}, \qquad
+n = \text{nonce}, \qquad
+i = \text{cursor}.
+\]
+
+For each cursor value \(i\), the message is:
+
+\[
+M_i = C \Vert \texttt{:} \Vert n \Vert \texttt{:} \Vert i.
+\]
+
+The digest block is:
+
+\[
+B_i = \operatorname{HMAC\text{-}SHA256}(S, M_i).
+\]
+
+Each digest block is 32 bytes. The byte stream is:
+
+\[
+B = B_0 \Vert B_1 \Vert B_2 \Vert \cdots.
+\]
+
+The same inputs always produce the same bytes. Without the server seed, the stream is computationally unpredictable.
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+message = f"{self.client_seed}:{self.nonce}:{self.cursor}".encode()
+output += hmac.new(self.server_seed.encode(), message, hashlib.sha256).digest()
+self.cursor += 1
+\end{lstlisting}
+
+The commitment helper is:
+
+\begin{lstlisting}[language=Python]
+def server_seed_hash(server_seed: str) -> str:
+    return hashlib.sha256(server_seed.encode()).hexdigest()
+\end{lstlisting}
+
+\subsection{Unbiased Bounded Integers}
+
+Many games need a random integer:
+
+\[
+X \in \{0, 1, \ldots, m - 1\}.
+\]
+
+A naive method would be:
+
+\[
+X = R \bmod m,
+\]
+
+but this creates modulo bias when the sample space size is not divisible by \(m\).
+
+The module avoids this with rejection sampling. Let:
+
+\[
+b = \max(1, \lceil \operatorname{bitlength}(m) / 8 \rceil).
+\]
+
+The sample space is:
+
+\[
+N = 2^{8b}.
+\]
+
+The largest unbiased accepted range is:
+
+\[
+L = N - (N \bmod m).
+\]
+
+The generator draws:
+
+\[
+R \in \{0,1,\ldots,N-1\}.
+\]
+
+If \(R \geq L\), the value is rejected and another value is drawn. If \(R < L\), the result is:
+
+\[
+X = R \bmod m.
+\]
+
+Because \(L\) is divisible by \(m\), every output in \(\{0,\ldots,m-1\}\) has exactly the same number of preimages.
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+byte_length = max(1, math.ceil(upper_bound.bit_length() / 8))
+sample_space = 1 << (8 * byte_length)
+unbiased_limit = sample_space - (sample_space % upper_bound)
+
+while True:
+    value = int.from_bytes(self.random_bytes(byte_length), "big")
+    if value < unbiased_limit:
+        return value % upper_bound
+\end{lstlisting}
+
+\section{Game Configuration: \texttt{game\_config.json}}
+
+The repository now has an editable JSON config file for target RTPs and rule settings:
+
+\begin{lstlisting}
+{
+  "crash": {
+    "target_rtp": 0.98,
+    "instant_crash_modulus": 25
+  },
+  "slots": {
+    "target_rtp": 0.96,
+    "volatility": 1.0,
+    "calibration_max_combinations": 1000000
+  },
+  "baccarat": {
+    "target_rtp": 0.9876,
+    "decks": 8,
+    "banker_commission": 0.05,
+    "tie_payout": 8.0
+  },
+  "blackjack": {
+    "target_rtp": 0.995,
+    "decks": 6,
+    "dealer_hits_soft_17": false,
+    "blackjack_payout": 1.5
+  }
+}
+\end{lstlisting}
+
+The values are decimals, so:
+
+\[
+0.98 = 98\% \operatorname{RTP}.
+\]
+
+For crash, \texttt{target\_rtp} is used directly as the payout scale:
+
+\[
+p = 100 \cdot \texttt{target\_rtp}.
+\]
+
+For baccarat and blackjack, RTP is primarily an output of rules and paytables. The \texttt{target\_rtp} value documents the intended target, while rule settings such as commission, tie payout, blackjack payout, dealer behavior, and deck count are what actually change the realized RTP.
+
+For slots, \texttt{target\_rtp} can now be applied directly by calibrating a \texttt{SlotConfig}. The module first applies a volatility shape, computes the shaped exact RTP, then scales every line and scatter payout by:
+
+\[
+\alpha = \frac{\texttt{target\_rtp}}{\operatorname{RTP}_{\text{shaped}}}.
+\]
+
+After scaling, the exact RTP becomes:
+
+\[
+\operatorname{RTP}_{\text{final}}
+=
+\alpha \operatorname{RTP}_{\text{shaped}}
+=
+\texttt{target\_rtp}.
+\]
+
+This works because the slot module's payout model is linear in paytable and scatter multipliers.
+
+Slot volatility is a numeric payout exponent:
+
+\[
+v = \texttt{volatility}.
+\]
+
+Before RTP calibration, each positive payout \(m\) becomes:
+
+\[
+m' = m^v,
+\]
+
+Values above 1 make large wins larger relative to small wins. Values below 1 compress large wins toward small wins. A value of 1 leaves payout shape unchanged. This changes payout variance while the later RTP calibration keeps the long-run average fixed.
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+def target_rtp(game: str, default: float) -> float:
+    value = float(setting(game, "target_rtp", default))
+    if value <= 0 or value > 1:
+        raise ValueError(f"{game} target_rtp must be between 0 and 1")
+    return value
+\end{lstlisting}
+
+\section{Cards and Shuffling: \texttt{cards.py}}
+
+\subsection{Deck Construction}
+
+For one deck:
+
+\[
+|\text{deck}| = 13 \cdot 4 = 52.
+\]
+
+For \(d\) decks:
+
+\[
+|\text{shoe}| = 52d.
+\]
+
+Cards are rank-suit pairs:
+
+\[
+\text{Card} = (\text{rank}, \text{suit}).
+\]
+
+\subsection{Fisher-Yates Shuffle}
+
+For a deck array \(A\) of length \(N\):
+
+\[
+\text{for } i = N-1,N-2,\ldots,1:
+\]
+
+\[
+j \leftarrow \operatorname{random\_int}(i+1),
+\]
+
+\[
+A_i \leftrightarrow A_j.
+\]
+
+Because \(\operatorname{random\_int}\) is unbiased, every physical permutation is equally likely:
+
+\[
+\Pr(\text{specific physical order}) = \frac{1}{N!}.
+\]
+
+For \(d\) decks, duplicate rank-suit labels exist, but the underlying shoe positions are still shuffled uniformly.
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+def build_deck(decks: int = 1) -> Deck:
+    return tuple(Card(rank, suit) for _ in range(decks) for suit in SUITS for rank in RANKS)
+
+def fisher_yates_shuffle(cards: Sequence[Card], rng: FairRng) -> Deck:
+    shuffled = list(cards)
+    for index in range(len(shuffled) - 1, 0, -1):
+        swap_index = rng.random_int(index + 1)
+        shuffled[index], shuffled[swap_index] = shuffled[swap_index], shuffled[index]
+    return tuple(shuffled)
+\end{lstlisting}
+
+\section{Crash Multiplier: \texttt{prng\_crash\_limbo.py}}
+
+\subsection{Per-Game Server Seed}
+
+The crash module derives a per-game seed:
+
+\[
+S_n = \operatorname{SHA256}(S_0 \Vert \texttt{:} \Vert n).
+\]
+
+Then it computes:
+
+\[
+D = \operatorname{HMAC\text{-}SHA256}(S_n, C \Vert \texttt{:} \Vert n \Vert \texttt{:0}).
+\]
+
+\subsection{Instant Crash}
+
+The code checks the first 8 hex characters of the digest:
+
+\[
+Y = \operatorname{int}(D_{0:8},16).
+\]
+
+This is a 32-bit value. With modulus \(q=25\), instant crash occurs when:
+
+\[
+Y \bmod q = 0.
+\]
+
+The exact finite probability is:
+
+\[
+\Pr(\text{instant crash})
+=
+\frac{\left\lfloor (2^{32}-1)/25 \right\rfloor + 1}{2^{32}}.
+\]
+
+This is approximately:
+
+\[
+\Pr(\text{instant crash}) \approx \frac{1}{25} = 0.04.
+\]
+
+\subsection{Multiplier Formula}
+
+If no instant crash occurs, the module takes 13 hex characters:
+
+\[
+h = \operatorname{int}(D_{0:13},16).
+\]
+
+Since one hex character is 4 bits:
+
+\[
+13 \cdot 4 = 52,
+\]
+
+so:
+
+\[
+0 \leq h < e, \qquad e = 2^{52}.
+\]
+
+With house edge \(r=2\%\), the payout percent is:
+
+\[
+p = 100-r = 98.
+\]
+
+The multiplier is:
+
+\[
+M = \max\left(1,\frac{pe-h}{100(e-h)}\right).
+\]
+
+As \(h\) approaches \(e\), the denominator \(e-h\) becomes small, creating rare large multipliers. Because of the \(\max(1,\cdot)\) clamp, some non-instant-crash hashes also return exactly \(1.00\). The raw expression is at most 1 when:
+
+\[
+\frac{pe-h}{100(e-h)} \leq 1.
+\]
+
+For \(p=98\), this simplifies to:
+
+\[
+h \leq \frac{2}{99}e.
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+server_seed = derive_server_seed(initial_seed, game_number)
+digest = hmac_sha256(server_seed, client_seed, nonce).hex()
+
+if is_divisible(digest, INSTANT_CRASH_MODULUS):
+    return 1.0
+
+hash_int = int(digest[:13], 16)
+max_hash_int = 2**52
+payout_percent = 100 - HOUSE_EDGE_PERCENT
+
+return max(1.0, (payout_percent * max_hash_int - hash_int) / (max_hash_int - hash_int) / 100)
+\end{lstlisting}
+
+\section{Slots: \texttt{slots.py}}
+
+\subsection{Weighted Reels}
+
+A reel is a sequence:
+
+\[
+R_k=(s_{k,0},s_{k,1},\ldots,s_{k,L_k-1}),
+\]
+
+where \(k\) is the reel index and \(L_k\) is the reel length.
+
+The helper \texttt{expand\_weighted\_reel} converts weights into repeated symbols. If symbol \(a\) has weight \(w_a\), then:
+
+\[
+\Pr(a \text{ is selected on that reel})=
+\frac{w_a}{\sum_b w_b}.
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+def expand_weighted_reel(symbol_weights: Mapping[Symbol, int]) -> Reel:
+    reel: list[Symbol] = []
+    for symbol, weight in symbol_weights.items():
+        reel.extend([symbol] * weight)
+    return tuple(reel)
+\end{lstlisting}
+
+\subsection{Reel Stops}
+
+For each reel \(k\), the PRNG chooses:
+
+\[
+x_k \in \{0,1,\ldots,L_k-1\}.
+\]
+
+The stop tuple is:
+
+\[
+\mathbf{x}=(x_0,x_1,\ldots,x_{K-1}).
+\]
+
+Because each stop is selected with unbiased \texttt{random\_int}:
+
+\[
+\Pr(\mathbf{x})=\prod_{k=0}^{K-1}\frac{1}{L_k}.
+\]
+
+\subsection{Visible Grid}
+
+For \(r\) visible rows:
+
+\[
+G_{i,k}=R_k[(x_k+i)\bmod L_k].
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+rng = FairRng(server_seed, client_seed, nonce)
+stops = tuple(rng.random_int(len(reel)) for reel in config.reels)
+
+def visible_grid(reels: Sequence[Reel], stops: Sequence[int], rows: int) -> Grid:
+    columns = []
+    for reel, stop in zip(reels, stops):
+        columns.append(tuple(reel[(stop + row) % len(reel)] for row in range(rows)))
+    return tuple(tuple(column[row] for column in columns) for row in range(rows))
+\end{lstlisting}
+
+\subsection{Payline Evaluation}
+
+A payline is:
+
+\[
+\ell=(\ell_0,\ell_1,\ldots,\ell_{K-1}).
+\]
+
+The symbols on the line are:
+
+\[
+(G_{\ell_0,0},G_{\ell_1,1},\ldots,G_{\ell_{K-1},K-1}).
+\]
+
+For each pay symbol \(a\), the module counts consecutive symbols from the left that are either \(a\) or the wild symbol \(W\):
+
+\[
+c_a=\max c \text{ such that } G_{\ell_i,i}\in\{a,W\}
+\text{ for }0\leq i<c.
+\]
+
+The selected line win is:
+
+\[
+\max_a \operatorname{paytable}(a,c_a).
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+for pay_symbol, payouts in config.paytable.items():
+    count = 0
+    for symbol in symbols:
+        if symbol == pay_symbol or symbol == config.wild_symbol:
+            count += 1
+        else:
+            break
+    multiplier = payouts.get(count)
+\end{lstlisting}
+
+\subsection{Scatter Evaluation}
+
+If a scatter symbol \(S\) is configured:
+
+\[
+c_S=\sum_{i,k}\mathbf{1}(G_{i,k}=S).
+\]
+
+If \(\operatorname{scatter\_pays}(c_S)\) exists, it is added to the total multiplier.
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+count = sum(symbol == config.scatter_symbol for row in grid for symbol in row)
+multiplier = config.scatter_pays.get(count)
+\end{lstlisting}
+
+\subsection{Total Multiplier and Payout}
+
+\[
+T=\sum_{\text{line wins } w}w+\text{scatter win}.
+\]
+
+For bet \(B\):
+
+\[
+\operatorname{payout}=BT.
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+total_multiplier = sum(win.multiplier for win in line_wins)
+if scatter_win is not None:
+    total_multiplier += scatter_win.multiplier
+payout = bet * total_multiplier
+\end{lstlisting}
+
+\subsection{Exact and Sample RTP}
+
+Let:
+
+\[
+\Omega=\prod_{k=0}^{K-1}\{0,1,\ldots,L_k-1\}.
+\]
+
+Then:
+
+\[
+|\Omega|=\prod_{k=0}^{K-1}L_k.
+\]
+
+Exact RTP is:
+
+\[
+\operatorname{RTP}
+=
+\frac{1}{|\Omega|}
+\sum_{\mathbf{x}\in\Omega}T(\mathbf{x}).
+\]
+
+For \(N\) sampled spins:
+
+\[
+\widehat{\operatorname{RTP}}
+=
+\frac{1}{N}\sum_{i=0}^{N-1}T_i.
+\]
+
+\subsection{Configurable Slot RTP}
+
+The helper \texttt{configure\_rtp} applies the configured slot volatility and target RTP. First, it shapes all configured line and scatter payouts:
+
+\[
+\operatorname{paytable}_{\text{shaped}}(a,c) = \operatorname{paytable}(a,c)^v,
+\]
+
+\[
+\operatorname{scatter\_pays}_{\text{shaped}}(c) = \operatorname{scatter\_pays}(c)^v.
+\]
+
+Then it scales all shaped payouts:
+
+\[
+\operatorname{paytable}'(a,c) = \alpha \operatorname{paytable}_{\text{shaped}}(a,c),
+\]
+
+\[
+\operatorname{scatter\_pays}'(c) = \alpha \operatorname{scatter\_pays}_{\text{shaped}}(c),
+\]
+
+where:
+
+\[
+\alpha = \frac{\texttt{target\_rtp}}{\operatorname{exact\_rtp}(\texttt{shaped config})}.
+\]
+
+This should be done once when constructing a game config, not once per spin.
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+stop_ranges = [range(len(reel)) for reel in config.reels]
+for stops in product(*stop_ranges):
+    total_multiplier += evaluate_stops(config, stops).total_multiplier
+return total_multiplier / combinations
+
+def configure_rtp(
+    config: SlotConfig,
+    target: Optional[float] = None,
+    volatility: Optional[float] = None,
+    max_combinations: Optional[int] = None,
+) -> SlotConfig:
+    target = target if target is not None else target_rtp("slots", 0.96)
+    shaped_config = shape_volatility(config, volatility_exponent(volatility))
+    base_rtp = exact_rtp(shaped_config, max_combinations=max_combinations)
+    return scale_payouts(shaped_config, target / base_rtp)
+\end{lstlisting}
+
+\section{Baccarat: \texttt{baccarat.py}}
+
+\subsection{Card Values}
+
+\[
+v(A)=1,\qquad v(2),\ldots,v(9)=2,\ldots,9,
+\]
+
+\[
+v(10)=v(J)=v(Q)=v(K)=0.
+\]
+
+The total is:
+
+\[
+H=\left(\sum_{c\in\text{hand}}v(c)\right)\bmod 10.
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+def baccarat_card_value(card: Card) -> int:
+    if card.rank == "A":
+        return 1
+    if card.rank in {"10", "J", "Q", "K"}:
+        return 0
+    return int(card.rank)
+
+def hand_total(cards: tuple[Card, ...]) -> int:
+    return sum(baccarat_card_value(card) for card in cards) % 10
+\end{lstlisting}
+
+\subsection{Initial Deal}
+
+For shuffled shoe \(D\):
+
+\[
+\text{Player}=(D_0,D_2),\qquad \text{Banker}=(D_1,D_3).
+\]
+
+A natural occurs if:
+
+\[
+H_P\in\{8,9\}\quad\text{or}\quad H_B\in\{8,9\}.
+\]
+
+If there is a natural, no third cards are drawn.
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+player_hand = [deck[0], deck[2]]
+banker_hand = [deck[1], deck[3]]
+natural = player_total in {8, 9} or banker_total in {8, 9}
+\end{lstlisting}
+
+\subsection{Draw Rules}
+
+If no natural occurs, the player draws if:
+
+\[
+H_P\leq 5.
+\]
+
+If the player did not draw, the banker draws if:
+
+\[
+H_B\leq 5.
+\]
+
+If the player did draw, let \(t\) be the value of the player's third card:
+
+\[
+\begin{array}{c|c}
+H_B & \text{Banker draws when} \\
+\hline
+0,1,2 & \text{always} \\
+3 & t\neq 8 \\
+4 & 2\leq t\leq 7 \\
+5 & 4\leq t\leq 7 \\
+6 & 6\leq t\leq 7 \\
+7 & \text{never}
+\end{array}
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+if player_third_card is None:
+    return banker_total <= 5
+if banker_total <= 2:
+    return True
+if banker_total == 3:
+    return player_third_value != 8
+if banker_total == 4:
+    return 2 <= player_third_value <= 7
+if banker_total == 5:
+    return 4 <= player_third_value <= 7
+if banker_total == 6:
+    return 6 <= player_third_value <= 7
+return False
+\end{lstlisting}
+
+\subsection{Outcome and Settlement}
+
+\[
+\text{outcome}=
+\begin{cases}
+\text{player},&H_P>H_B,\\
+\text{banker},&H_B>H_P,\\
+\text{tie},&H_P=H_B.
+\end{cases}
+\]
+
+Let stake be \(B\), banker commission be \(\gamma\), and tie payout be \(\tau\). Profit is:
+
+\[
+\operatorname{profit}_{\text{player bet}}=
+\begin{cases}
+B,&\text{player wins},\\
+0,&\text{tie},\\
+-B,&\text{banker wins},
+\end{cases}
+\]
+
+\[
+\operatorname{profit}_{\text{banker bet}}=
+\begin{cases}
+B(1-\gamma),&\text{banker wins},\\
+0,&\text{tie},\\
+-B,&\text{player wins},
+\end{cases}
+\]
+
+\[
+\operatorname{profit}_{\text{tie bet}}=
+\begin{cases}
+B\tau,&\text{tie},\\
+-B,&\text{otherwise}.
+\end{cases}
+\]
+
+Returned payout is:
+
+\[
+\operatorname{payout}=B+\operatorname{profit}.
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+if bet_on == "tie":
+    profit = stake * tie_payout if round_result.outcome == "tie" else -stake
+elif round_result.outcome == "tie":
+    profit = 0.0
+elif bet_on == round_result.outcome:
+    multiplier = 1.0 - banker_commission if bet_on == "banker" else 1.0
+    profit = stake * multiplier
+else:
+    profit = -stake
+\end{lstlisting}
+
+\section{Blackjack: \texttt{blackjack.py}}
+
+\subsection{Card Values and Aces}
+
+\[
+v(2),\ldots,v(10)=2,\ldots,10,
+\]
+
+\[
+v(J)=v(Q)=v(K)=10,\qquad v(A)=11\text{ initially}.
+\]
+
+If the total \(T\) is above 21 and there are aces valued as 11, each ace conversion subtracts 10:
+
+\[
+T\leftarrow T-10.
+\]
+
+The hand is soft if at least one ace remains valued as 11.
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+total = sum(blackjack_card_value(card) for card in cards)
+aces = sum(card.rank == "A" for card in cards)
+while total > 21 and aces:
+    total -= 10
+    aces -= 1
+return total, aces > 0
+\end{lstlisting}
+
+\subsection{Natural Blackjack}
+
+\[
+\text{natural}\iff |\text{cards}|=2 \land T=21 \land \neg\text{from\_split}.
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+def is_natural_blackjack(hand: BlackjackHand) -> bool:
+    total, _ = hand_value(hand.cards)
+    return len(hand.cards) == 2 and total == 21 and not hand.from_split
+\end{lstlisting}
+
+\subsection{Initial Deal}
+
+For shuffled deck \(D\):
+
+\[
+\text{Player}=(D_0,D_2),\qquad \text{Dealer}=(D_1,D_3).
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+player_hand = BlackjackHand(cards=(deck[0], deck[2]))
+dealer_hand = BlackjackHand(cards=(deck[1], deck[3]))
+\end{lstlisting}
+
+\subsection{Actions}
+
+Hit appends the next card:
+
+\[
+H'=H\Vert D_i.
+\]
+
+Stand marks the hand complete. Double down doubles the bet, draws one card, and stands:
+
+\[
+B'=2B.
+\]
+
+A split is allowed when the two cards have equal blackjack value:
+
+\[
+v(c_0)=v(c_1).
+\]
+
+The split creates:
+
+\[
+H_1=(c_0,D_i),\qquad H_2=(c_1,D_{i+1}).
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+updated_hand = replace(
+    hand,
+    cards=hand.cards + (card,),
+    bet=hand.bet * 2,
+    stood=True,
+    doubled=True,
+)
+\end{lstlisting}
+
+\subsection{Dealer Rule}
+
+The dealer draws while:
+
+\[
+T_D<17.
+\]
+
+If the rules say dealer hits soft 17, the dealer also draws when:
+
+\[
+T_D=17\quad\text{and}\quad\text{soft}=\text{true}.
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+def should_dealer_draw(dealer: BlackjackHand, rules: BlackjackRules) -> bool:
+    total, soft = hand_value(dealer.cards)
+    if total < 17:
+        return True
+    return total == 17 and soft and rules.dealer_hits_soft_17
+\end{lstlisting}
+
+\subsection{Settlement}
+
+Let player total be \(T_P\), dealer total be \(T_D\), hand bet be \(B\), and blackjack payout be \(\beta=1.5\) by default. Net profit is:
+
+\[
+\operatorname{profit}=
+\begin{cases}
+-B,&T_P>21,\\
+0,&\text{player natural and dealer natural},\\
+B\beta,&\text{player natural only},\\
+-B,&\text{dealer natural only},\\
+B,&T_D>21,\\
+B,&T_P>T_D,\\
+-B,&T_P<T_D,\\
+0,&T_P=T_D.
+\end{cases}
+\]
+
+Returned payout is:
+
+\[
+\operatorname{payout}=B+\operatorname{profit}.
+\]
+
+\subsection{Code}
+
+\begin{lstlisting}[language=Python]
+if player_total > 21:
+    profit = -hand.bet
+elif player_blackjack and dealer_blackjack:
+    profit = 0.0
+elif player_blackjack:
+    profit = hand.bet * rules.blackjack_payout
+elif dealer_blackjack:
+    profit = -hand.bet
+elif dealer_bust:
+    profit = hand.bet
+elif player_total > dealer_total:
+    profit = hand.bet
+elif player_total < dealer_total:
+    profit = -hand.bet
+else:
+    profit = 0.0
+\end{lstlisting}
+
+\section{Expected Value and RTP}
+
+All games can be interpreted through expected value. If outcome \(o\) has probability \(P(o)\) and payout multiplier \(m(o)\), then:
+
+\[
+\operatorname{RTP}=\mathbb{E}[m]=\sum_{o\in\Omega}P(o)m(o).
+\]
+
+House edge is:
+
+\[
+\operatorname{house\ edge}=1-\operatorname{RTP}.
+\]
+
+For slots, \(\Omega\) is the set of reel-stop combinations. For baccarat and blackjack, \(\Omega\) is the set of possible shuffled deck orders and player decisions. Baccarat has fixed decisions after the shuffle; blackjack is strategy-dependent.
+
+\section{Math Audit Notes}
+
+\begin{itemize}
+    \item The shared PRNG uses rejection sampling, so bounded integers are unbiased as long as HMAC-SHA256 is modeled as uniformly random.
+    \item Fisher-Yates is uniform because each swap index is drawn uniformly from \(\{0,\ldots,i\}\).
+    \item With multiple decks, identical rank-suit labels repeat, but the underlying shoe positions are still shuffled uniformly.
+    \item The crash instant-crash branch is approximately \(1/25\), with the exact finite 32-bit probability shown above.
+    \item The crash multiplier can return \(1.00\) through both the explicit divisible-by-25 branch and the \(\max(1,\cdot)\) clamp.
+    \item Slot RTP in this module is represented as an average payout multiplier. To express it as a percent, multiply by 100.
+    \item Baccarat settlement uses net profit. A winning tie bet at \(8{:}1\) has profit \(8B\) and returned payout \(9B\).
+    \item Blackjack settlement also uses net profit. A natural blackjack at \(3{:}2\) has profit \(1.5B\) and returned payout \(2.5B\).
+\end{itemize}
+
+\section{Verification Flow}
+
+A verification-friendly round has this structure:
+
+\begin{enumerate}
+    \item Casino chooses private server seed \(S\).
+    \item Casino publishes commitment \(C_S=\operatorname{SHA256}(S)\).
+    \item Player chooses or accepts client seed \(C\).
+    \item Game uses nonce \(n\).
+    \item Outcome is computed deterministically from \((S,C,n)\).
+    \item Casino reveals \(S\).
+    \item Player checks \(\operatorname{SHA256}(S)=C_S\), then recomputes the game outcome.
+\end{enumerate}
+
+This proves the revealed seed matches the prior commitment. It does not prove that a paytable is favorable or that a game has a high RTP; it proves that the outcome was generated from the committed seed, client seed, and nonce.
+
+\end{document}

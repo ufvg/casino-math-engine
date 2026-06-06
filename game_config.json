@@ -1,0 +1,23 @@
+{
+  "crash": {
+    "target_rtp": 0.98,
+    "instant_crash_modulus": 25
+  },
+  "slots": {
+    "target_rtp": 0.96,
+    "volatility": 1.0,
+    "calibration_max_combinations": 1000000
+  },
+  "baccarat": {
+    "target_rtp": 0.98,
+    "decks": 8,
+    "banker_commission": 0.05,
+    "tie_payout": 8.0
+  },
+  "blackjack": {
+    "target_rtp": 0.99,
+    "decks": 6,
+    "dealer_hits_soft_17": false,
+    "blackjack_payout": 1.5
+  }
+}
